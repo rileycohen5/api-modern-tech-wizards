@@ -7,23 +7,29 @@ import logging
 
 def parse_human_datetime(dt_str: str):
     """
-    Robust parser for AI-generated datetime strings.
-    Handles:
-    - extra commas
-    - missing colon ("12 30 PM")
-    - timezone phrases pushed to next word
-    - different formats
+    Ultra-robust parser for AI-generated datetime strings.
+    Accepts:
+    - Missing commas
+    - Hours without minutes ("11 AM")
+    - Missing colon ("11 30 AM")
+    - Weird spacing
+    - Full or abbreviated timezones
     """
 
     import re
+    from datetime import datetime
+    import pytz
 
-    # Normalize: remove commas
-    dt_str = dt_str.replace(",", "")
+    # Normalize commas + spaces
+    s = re.sub(r"[,\s]+", " ", dt_str).strip()
 
-    # Fix missing colon between HH and MM
-    dt_str = re.sub(r"(\b\d{1,2})\s+(\d{2}\b)", r"\1:\2", dt_str)
+    # Fix missing colon between HH and MM (e.g. "11 30 AM")
+    s = re.sub(r"\b(\d{1,2}) (\d{2}) (AM|PM)\b", r"\1:\2 \3", s, flags=re.IGNORECASE)
 
-    # Map full timezone names
+    # Fix "11 AM" → "11:00 AM"
+    s = re.sub(r"\b(\d{1,2}) (AM|PM)\b", r"\1:00 \2", s, flags=re.IGNORECASE)
+
+    # TIMEZONE MAPPING
     full_tz_map = {
         "PACIFIC STANDARD TIME": "America/Los_Angeles",
         "PACIFIC DAYLIGHT TIME": "America/Los_Angeles",
@@ -46,37 +52,48 @@ def parse_human_datetime(dt_str: str):
         "EDT": "America/New_York",
     }
 
-    # 1️⃣ Extract timezone from END of string using regex
+    # Extract timezone
     tz_regex = r"(Pacific Standard Time|Pacific Daylight Time|Mountain Standard Time|Mountain Daylight Time|Central Standard Time|Central Daylight Time|Eastern Standard Time|Eastern Daylight Time|PST|PDT|MST|MDT|CST|CDT|EST|EDT)$"
-    
-    tz_match = re.search(tz_regex, dt_str, re.IGNORECASE)
+    tz_match = re.search(tz_regex, s, re.IGNORECASE)
+
     if not tz_match:
         raise ValueError(f"Could not extract timezone from: {dt_str}")
 
-    tz_text = tz_match.group(0).upper()
+    tz_raw = tz_match.group(0).upper()
 
-    # Map to IANA
-    if tz_text in (k.upper() for k in full_tz_map.keys()):
-        for k, v in full_tz_map.items():
-            if tz_text == k:
-                tz_name = v
-                break
-    elif tz_text in abbrev_map:
-        tz_name = abbrev_map[tz_text]
+    # Determine IANA zone
+    if tz_raw in full_tz_map:
+        tz_name = full_tz_map[tz_raw]
+    elif tz_raw in abbrev_map:
+        tz_name = abbrev_map[tz_raw]
     else:
-        raise ValueError(f"Unknown timezone: {tz_text}")
+        raise ValueError(f"Unknown timezone: {tz_raw}")
 
-    # Remove timezone from string
-    dt_without_tz = re.sub(tz_regex, "", dt_str, flags=re.IGNORECASE).strip()
+    # Strip timezone from string
+    s_no_tz = re.sub(tz_regex, "", s, flags=re.IGNORECASE).strip()
 
-    # Now parse the datetime part
-    try:
-        naive = datetime.strptime(dt_without_tz, "%A %B %d %Y at %I:%M %p")
-    except Exception as e:
-        raise ValueError(f"Invalid datetime portion: '{dt_without_tz}'. Error: {e}")
+    # Try multiple formats
+    fmts = [
+        "%A %B %d %Y at %I:%M %p",
+        "%A %B %d %Y %I:%M %p",
+        "%A %B %d %Y at %I:%M%p",
+        "%A %B %d %Y %I:%M%p",
+    ]
+
+    naive = None
+    for fmt in fmts:
+        try:
+            naive = datetime.strptime(s_no_tz, fmt)
+            break
+        except:
+            pass
+
+    if naive is None:
+        raise ValueError(f"Invalid datetime portion: '{s_no_tz}'")
 
     tz = pytz.timezone(tz_name)
     return tz.localize(naive)
+
 
 
 
