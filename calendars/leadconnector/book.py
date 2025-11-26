@@ -7,15 +7,11 @@ import logging
 import re
 
 
-# -------------------------------------------
-# ULTRA robust LLM datetime parser
-# -------------------------------------------
-
 def parse_human_datetime(dt_str: str):
     """
     Ultra-robust parser for AI-generated datetime strings.
     Handles:
-    - commas anywhere
+    - commas
     - ordinals ("28th")
     - abbreviated months ("Nov")
     - missing colon ("11 30 AM")
@@ -23,6 +19,7 @@ def parse_human_datetime(dt_str: str):
     - weird spacing
     - "at" missing or moved
     - full or abbreviated timezones
+    - times with seconds ("08:30:00 AM")
     """
 
     from datetime import datetime
@@ -33,7 +30,7 @@ def parse_human_datetime(dt_str: str):
     # 1) Normalize whitespace
     s = re.sub(r"\s+", " ", dt_str).strip()
 
-    # 2) Remove ordinal suffixes ("st", "nd", "rd", "th")
+    # 2) Remove ordinal suffixes ("st", "nd", "rd", "th") -> "28th" -> "28"
     s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s, flags=re.IGNORECASE)
 
     # 3) Remove commas
@@ -48,7 +45,10 @@ def parse_human_datetime(dt_str: str):
     # 6) Fix hour-only times ("11 AM" → "11:00 AM")
     s = re.sub(r"\b(\d{1,2}) (AM|PM)\b", r"\1:00 \2", s, flags=re.IGNORECASE)
 
-    # 7) Insert "at" if missing ("Friday November 28 2025 11:00 AM")
+    # 7) Strip seconds if present ("08:30:00 AM" → "08:30 AM")
+    s = re.sub(r"\b(\d{1,2}:\d{2}):\d{2}\b", r"\1", s)
+
+    # 8) Insert "at" if missing between year and time ("2025 08:30 AM" → "2025 at 08:30 AM")
     s = re.sub(
         r"(\d{4}) (\d{1,2}:\d{2} (AM|PM))",
         r"\1 at \2",
@@ -81,7 +81,7 @@ def parse_human_datetime(dt_str: str):
         "EDT": "America/New_York",
     }
 
-    # Extract timezone
+    # Extract timezone (must be at the end)
     tz_regex = (
         r"(Pacific Standard Time|Pacific Daylight Time|Mountain Standard Time|"
         r"Mountain Daylight Time|Central Standard Time|Central Daylight Time|"
@@ -97,20 +97,23 @@ def parse_human_datetime(dt_str: str):
     if tz_raw in full_tz_map:
         tz_name = full_tz_map[tz_raw]
     else:
-        tz_name = abbrev_map[tz_raw]
+        tz_name = abbrev_map.get(tz_raw)
 
-    # Strip timezone
+    if not tz_name:
+        raise ValueError(f"[ERROR] Unknown timezone: {tz_raw}")
+
+    # Strip timezone for datetime parsing
     s_no_tz = re.sub(tz_regex, "", s, flags=re.IGNORECASE).strip()
     logging.info(f"[PARSE] Datetime without timezone: {s_no_tz}")
 
-    # Try a wide range of formats
+    # Try multiple formats (weekday + full month + day + year + time)
     fmts = [
         "%A %B %d %Y at %I:%M %p",
         "%A %b %d %Y at %I:%M %p",
-        "%A %B %d %Y %I:%M %p",
-        "%A %b %d %Y %I:%M %p",
         "%B %d %Y at %I:%M %p",
         "%b %d %Y at %I:%M %p",
+        "%A %B %d %Y %I:%M %p",
+        "%A %b %d %Y %I:%M %p",
         "%B %d %Y %I:%M %p",
         "%b %d %Y %I:%M %p",
     ]
@@ -120,7 +123,7 @@ def parse_human_datetime(dt_str: str):
         try:
             naive = datetime.strptime(s_no_tz, fmt)
             break
-        except:
+        except Exception:
             continue
 
     if naive is None:
@@ -132,12 +135,10 @@ def parse_human_datetime(dt_str: str):
     return tz.localize(naive)
 
 
-
-# -------------------------------------------
-# Detect calendar timezone
-# -------------------------------------------
-
 def detect_calendar_timezone(calendar_id, token):
+    """
+    Makes a free-slots API call and returns the timezone from one slot.
+    """
     now = datetime.now(pytz.utc)
     start_ms = int(now.timestamp() * 1000)
     end_ms = int((now + timedelta(days=7)).timestamp() * 1000)
@@ -159,17 +160,18 @@ def detect_calendar_timezone(calendar_id, token):
     raise Exception("[ERROR] Calendar returned no slots to detect timezone")
 
 
-
-# -------------------------------------------
-# BOOKING FUNCTION
-# -------------------------------------------
-
 def book_leadconnector_appointment(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Schedules an appointment in LeadConnector via POST body payload.
+    """
+
+    # Parse JSON body
     try:
         body = req.get_json()
-    except:
-        return func.HttpResponse("Invalid JSON", status_code=400)
+    except Exception:
+        return func.HttpResponse("Request body must be valid JSON.", status_code=400)
 
+    # Extract fields from JSON
     dt_str      = body.get("proposed_datetime")
     calendar_id = body.get("calendar_id")
     lead_name   = body.get("lead_name")
@@ -178,27 +180,35 @@ def book_leadconnector_appointment(req: func.HttpRequest) -> func.HttpResponse:
     contact_id  = body.get("contactId")
     token       = body.get("token") or req.headers.get("Authorization")
 
+    # Validate required fields
     if not all([dt_str, calendar_id, lead_name, location_id, contact_id, token]):
         return func.HttpResponse(
-            "Missing required fields",
-            status_code=400
+            "Missing parameters. Required: proposed_datetime, calendar_id, lead_name, locationId, contactId, token",
+            status_code=400,
         )
 
+    # 1️⃣ Convert user datetime → timezone-aware
     try:
-        requested_dt = parse_human_datetime(dt_str)
+        requested_customer_dt = parse_human_datetime(dt_str)
     except Exception as e:
+        logging.exception("Failed to parse datetime")
         return func.HttpResponse(str(e), status_code=400)
 
+    # 2️⃣ Detect calendar timezone
     try:
         calendar_tz = detect_calendar_timezone(calendar_id, token)
     except Exception as e:
+        logging.exception("Failed to detect calendar timezone")
         return func.HttpResponse(str(e), status_code=500)
 
-    calendar_dt = requested_dt.astimezone(calendar_tz)
+    # 3️⃣ Convert customer → calendar timezone
+    calendar_dt = requested_customer_dt.astimezone(calendar_tz)
 
+    # 4️⃣ Create start/end
     start_iso = calendar_dt.isoformat()
     end_iso = (calendar_dt + timedelta(minutes=30)).isoformat()
 
+    # Build API payload
     payload = {
         "title": f"AI Scheduled Call - {lead_name}",
         "calendarId": calendar_id,
@@ -226,10 +236,13 @@ def book_leadconnector_appointment(req: func.HttpRequest) -> func.HttpResponse:
     res = requests.post(url, headers=headers, json=payload)
 
     return func.HttpResponse(
-        json.dumps({
-            "response": res.text,
-            "payload": payload
-        }, indent=2),
+        json.dumps(
+            {
+                "response": res.text,
+                "payload": payload,
+            },
+            indent=2,
+        ),
         mimetype="application/json",
-        status_code=res.status_code
+        status_code=res.status_code,
     )
