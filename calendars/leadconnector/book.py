@@ -4,30 +4,59 @@ import pytz
 import azure.functions as func
 import json
 import logging
+import re
+
+
+# -------------------------------------------
+# ULTRA robust LLM datetime parser
+# -------------------------------------------
 
 def parse_human_datetime(dt_str: str):
     """
     Ultra-robust parser for AI-generated datetime strings.
-    Accepts:
-    - Missing commas
-    - Hours without minutes ("11 AM")
-    - Missing colon ("11 30 AM")
-    - Weird spacing
-    - Full or abbreviated timezones
+    Handles:
+    - commas anywhere
+    - ordinals ("28th")
+    - abbreviated months ("Nov")
+    - missing colon ("11 30 AM")
+    - missing minutes ("11 AM")
+    - weird spacing
+    - "at" missing or moved
+    - full or abbreviated timezones
     """
 
-    import re
     from datetime import datetime
     import pytz
 
-    # Normalize commas + spaces
-    s = re.sub(r"[,\s]+", " ", dt_str).strip()
+    original = dt_str
 
-    # Fix missing colon between HH and MM (e.g. "11 30 AM")
+    # 1) Normalize whitespace
+    s = re.sub(r"\s+", " ", dt_str).strip()
+
+    # 2) Remove ordinal suffixes ("st", "nd", "rd", "th")
+    s = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s, flags=re.IGNORECASE)
+
+    # 3) Remove commas
+    s = s.replace(",", "")
+
+    # 4) Fix missing space before AM/PM ("11AM" → "11 AM")
+    s = re.sub(r"(\d)(AM|PM)\b", r"\1 \2", s, flags=re.IGNORECASE)
+
+    # 5) Fix missing colon ("11 30 AM" → "11:30 AM")
     s = re.sub(r"\b(\d{1,2}) (\d{2}) (AM|PM)\b", r"\1:\2 \3", s, flags=re.IGNORECASE)
 
-    # Fix "11 AM" → "11:00 AM"
+    # 6) Fix hour-only times ("11 AM" → "11:00 AM")
     s = re.sub(r"\b(\d{1,2}) (AM|PM)\b", r"\1:00 \2", s, flags=re.IGNORECASE)
+
+    # 7) Insert "at" if missing ("Friday November 28 2025 11:00 AM")
+    s = re.sub(
+        r"(\d{4}) (\d{1,2}:\d{2} (AM|PM))",
+        r"\1 at \2",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    logging.info(f"[PARSE] Normalized datetime: {s}")
 
     # TIMEZONE MAPPING
     full_tz_map = {
@@ -53,31 +82,37 @@ def parse_human_datetime(dt_str: str):
     }
 
     # Extract timezone
-    tz_regex = r"(Pacific Standard Time|Pacific Daylight Time|Mountain Standard Time|Mountain Daylight Time|Central Standard Time|Central Daylight Time|Eastern Standard Time|Eastern Daylight Time|PST|PDT|MST|MDT|CST|CDT|EST|EDT)$"
-    tz_match = re.search(tz_regex, s, re.IGNORECASE)
+    tz_regex = (
+        r"(Pacific Standard Time|Pacific Daylight Time|Mountain Standard Time|"
+        r"Mountain Daylight Time|Central Standard Time|Central Daylight Time|"
+        r"Eastern Standard Time|Eastern Daylight Time|PST|PDT|MST|MDT|CST|CDT|EST|EDT)$"
+    )
 
+    tz_match = re.search(tz_regex, s, re.IGNORECASE)
     if not tz_match:
-        raise ValueError(f"Could not extract timezone from: {dt_str}")
+        raise ValueError(f"[ERROR] Could not extract timezone from: {original}")
 
     tz_raw = tz_match.group(0).upper()
 
-    # Determine IANA zone
     if tz_raw in full_tz_map:
         tz_name = full_tz_map[tz_raw]
-    elif tz_raw in abbrev_map:
-        tz_name = abbrev_map[tz_raw]
     else:
-        raise ValueError(f"Unknown timezone: {tz_raw}")
+        tz_name = abbrev_map[tz_raw]
 
-    # Strip timezone from string
+    # Strip timezone
     s_no_tz = re.sub(tz_regex, "", s, flags=re.IGNORECASE).strip()
+    logging.info(f"[PARSE] Datetime without timezone: {s_no_tz}")
 
-    # Try multiple formats
+    # Try a wide range of formats
     fmts = [
         "%A %B %d %Y at %I:%M %p",
+        "%A %b %d %Y at %I:%M %p",
         "%A %B %d %Y %I:%M %p",
-        "%A %B %d %Y at %I:%M%p",
-        "%A %B %d %Y %I:%M%p",
+        "%A %b %d %Y %I:%M %p",
+        "%B %d %Y at %I:%M %p",
+        "%b %d %Y at %I:%M %p",
+        "%B %d %Y %I:%M %p",
+        "%b %d %Y %I:%M %p",
     ]
 
     naive = None
@@ -86,22 +121,23 @@ def parse_human_datetime(dt_str: str):
             naive = datetime.strptime(s_no_tz, fmt)
             break
         except:
-            pass
+            continue
 
     if naive is None:
-        raise ValueError(f"Invalid datetime portion: '{s_no_tz}'")
+        raise ValueError(
+            f"[ERROR] Invalid datetime after normalization: '{s_no_tz}'\nOriginal: '{original}'"
+        )
 
     tz = pytz.timezone(tz_name)
     return tz.localize(naive)
 
 
 
-
+# -------------------------------------------
+# Detect calendar timezone
+# -------------------------------------------
 
 def detect_calendar_timezone(calendar_id, token):
-    """
-    Makes a free-slots API call and returns the timezone from one slot.
-    """
     now = datetime.now(pytz.utc)
     start_ms = int(now.timestamp() * 1000)
     end_ms = int((now + timedelta(days=7)).timestamp() * 1000)
@@ -112,7 +148,7 @@ def detect_calendar_timezone(calendar_id, token):
 
     res = requests.get(url, headers=headers, params=params)
     if res.status_code != 200:
-        raise Exception(f"Cannot detect calendar timezone: {res.text}")
+        raise Exception(f"[ERROR] Cannot detect calendar timezone: {res.text}")
 
     data = res.json()
     for _, obj in data.items():
@@ -120,24 +156,20 @@ def detect_calendar_timezone(calendar_id, token):
             dt = datetime.fromisoformat(obj["slots"][0])
             return dt.tzinfo
 
-    raise Exception("Calendar returned no slots to detect timezone")
+    raise Exception("[ERROR] Calendar returned no slots to detect timezone")
 
+
+
+# -------------------------------------------
+# BOOKING FUNCTION
+# -------------------------------------------
 
 def book_leadconnector_appointment(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Schedules an appointment in LeadConnector via POST body payload.
-    """
-
-    # Try parsing JSON body
     try:
         body = req.get_json()
     except:
-        return func.HttpResponse(
-            "Request body must be valid JSON.",
-            status_code=400
-        )
+        return func.HttpResponse("Invalid JSON", status_code=400)
 
-    # Extract fields from JSON
     dt_str      = body.get("proposed_datetime")
     calendar_id = body.get("calendar_id")
     lead_name   = body.get("lead_name")
@@ -146,33 +178,27 @@ def book_leadconnector_appointment(req: func.HttpRequest) -> func.HttpResponse:
     contact_id  = body.get("contactId")
     token       = body.get("token") or req.headers.get("Authorization")
 
-    # Validate required fields
     if not all([dt_str, calendar_id, lead_name, location_id, contact_id, token]):
         return func.HttpResponse(
-            "Missing parameters. Required: proposed_datetime, calendar_id, lead_name, locationId, contactId, token",
+            "Missing required fields",
             status_code=400
         )
 
-    # 1️⃣ Convert user datetime → timezone-aware
     try:
-        requested_customer_dt = parse_human_datetime(dt_str)
+        requested_dt = parse_human_datetime(dt_str)
     except Exception as e:
         return func.HttpResponse(str(e), status_code=400)
 
-    # 2️⃣ Detect calendar timezone
     try:
         calendar_tz = detect_calendar_timezone(calendar_id, token)
     except Exception as e:
         return func.HttpResponse(str(e), status_code=500)
 
-    # 3️⃣ Convert customer → calendar timezone
-    calendar_dt = requested_customer_dt.astimezone(calendar_tz)
+    calendar_dt = requested_dt.astimezone(calendar_tz)
 
-    # 4️⃣ Create start/end
     start_iso = calendar_dt.isoformat()
     end_iso = (calendar_dt + timedelta(minutes=30)).isoformat()
 
-    # Build API payload
     payload = {
         "title": f"AI Scheduled Call - {lead_name}",
         "calendarId": calendar_id,
@@ -187,30 +213,23 @@ def book_leadconnector_appointment(req: func.HttpRequest) -> func.HttpResponse:
         "description": description,
         "ignoreDateRange": False,
         "toNotify": True,
-        "ignoreFreeSlotValidation": False
+        "ignoreFreeSlotValidation": False,
     }
 
-    #print(payload)
-    #logging.info(f"Payload being sent: {json.dumps(payload, indent=2)}")
-
-
-    # Make booking request
     url = "https://services.leadconnectorhq.com/calendars/events/appointments"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "version":"2021-04-15"
+        "version": "2021-04-15",
     }
 
     res = requests.post(url, headers=headers, json=payload)
 
     return func.HttpResponse(
-    json.dumps({
-        "response": res.text,
-        "payload": payload
-    }, indent=2),
-    mimetype="application/json",
-    status_code=res.status_code
-)
-
-
+        json.dumps({
+            "response": res.text,
+            "payload": payload
+        }, indent=2),
+        mimetype="application/json",
+        status_code=res.status_code
+    )
