@@ -1,6 +1,8 @@
 import azure.functions as func
 from calendars.leadconnector.leadconnector import handle_leadconnector_request
 from calendars.leadconnector.book import book_leadconnector_appointment
+from voiceagents.twiml import handle_twiml
+from voiceagents.twiml import handle_input
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -35,3 +37,16 @@ def calendar_router(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="calendar/leadconnector/book")
 def lc_book(req: func.HttpRequest):
     return book_leadconnector_appointment(req)
+
+
+# ------------------------
+# VOICE AGENT ROUTES
+# ------------------------
+@app.route(route="voiceagents/twiml", methods=["GET", "POST"])
+def voiceagents_twiml(req: func.HttpRequest) -> func.HttpResponse:
+    # Delegate to the implementation in voiceagents.twiml
+    return handle_twiml(req)
+
+@app.route(route="voiceagents/handle-input", methods=["POST"])
+def voiceagents_handle_input(req: func.HttpRequest):
+    return handle_input(req)
